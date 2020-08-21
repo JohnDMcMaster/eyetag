@@ -68,22 +68,30 @@ def parse_b(s):
     return s
 
 def iter_decode(fn):
-    """Time [s]    TAP state    TDI    TDO    TDIBitCount    TDOBitCount"""
+    """
+    Time [s]    TAP state    TDI    TDO    TDIBitCount    TDOBitCount
+    
+    Time [s], Analyzer Name, Decoded Protocol Result
+    """
     f = open(fn, "r")
-    f.readline()
+    cols = f.readline().split(";")
     for l in f:
         l = l.strip()
-        t, state, tdi, tdo, tdin, tdon = l.split(",")
+        if len(cols) == 6:
+            t, state, tdi, tdo, tdin, tdon = l.split(";")
+        else:
+            assert 0, len(cols)
+            
         t = float(t)
         tdi = parse_b(tdi)
-        if tdi:
+        if tdi and tdin:
             tdin = int(tdin)
             assert len(tdi) == tdin
         else:
             tdi = None
             tdin = None
         tdo = parse_b(tdo)
-        if tdo:
+        if tdo and tdon:
             tdon = int(tdon)
             assert len(tdo) == tdon
         else:
@@ -154,8 +162,13 @@ If RnW is shifted in as 1, the request is to read the value of the addressed reg
 is ignored. You must read the scan chain again to obtain the value read from the register.
 """
 
+class ParseError(Exception):
+    pass
+
 def parse_dpap_tdo(tdo, prefix="", verbose=False):
-    assert len(tdo) == 35, len(tdo)
+    # Clock glitch
+    if len(tdo) != 35:
+        raise ParseError()
     ackbits = tdo[32:35]
     if ackbits == "010":
         # OK/FAULT
@@ -170,7 +183,8 @@ def parse_dpap_tdo(tdo, prefix="", verbose=False):
     return data, ack
 
 def parse_dpap_tdi(tdi, prefix="", verbose=False):
-    assert len(tdi) == 35
+    if len(tdi) != 35:
+        raise ParseError()
     data = int(tdi[0:32], 2)
     a = int(tdi[32:34], 2)
     rnw = int(tdi[34], 2)
@@ -299,10 +313,10 @@ def ap_reg_str(reg):
         0x04: "PSEL",
         0x08: "PSTA",
         0x0C: "RES_0C",
-        0x10: "FIFO_10",
-        0x14: "FIFO_14",
-        0x18: "FIFO_18",
-        0x1C: "FIFO_1C",
+        0x10: "BXFIFO1",
+        0x14: "BXFIFO2",
+        0x18: "BXFIFO3",
+        0x1C: "BXFIFO4",
         0xFC: "IDR",
         }.get(reg, "unknown")
 
@@ -317,6 +331,7 @@ class EyeTAG:
         self.apsel = 0
         self.apbanksel = 0
         self.apdpsel = 0
+        self.print_cmdn = False
 
     def iter_jtag_wr(self, fn_in):
         self.ir = None
@@ -326,13 +341,14 @@ class EyeTAG:
         self.part_ver = None
         self.cmdn = 0
         for p in iter_decode(fn_in):
-            _t, state, tdi, tdo = p
+            t, state, tdi, tdo = p
             if state == 'Run-Test/Idle':
-                self.cmdn += 1
-                if self.cmdn >= self.cmd_max:
-                    return
+                if self.print_cmdn:
+                    self.cmdn += 1
+                    if self.cmdn >= self.cmd_max:
+                        return
                 self.jtag_verbose and print("")
-                self.jtag_verbose and print("Group %u" % self.cmdn)
+                self.jtag_verbose and print("Group %u @ %s" % (self.cmdn, t))
             self.jtag_verbose and print(state)
             if state == "Test-Logic-Reset":
                 ir = "IDCODE"
@@ -473,6 +489,9 @@ class EyeTAG:
                 # There will be one orphaned transaction
                 self.next_decode(last_data, None)
                 break
+            except ParseError:
+                print("WARNING: parse error, continuing best as possible")
+                continue
 
             this_ir = this_data[0]
             if last_data:
