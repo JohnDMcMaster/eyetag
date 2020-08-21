@@ -125,9 +125,9 @@ def parse_idcode_str(idcode):
     vendor, part, version  = parse_idcode(idcode)
     vendors = jed_id2str[vendor]
     parts = part_id2str[vendors][part]
-    print("  vendor 0x%03X => %s" %(vendor, vendors))
-    print("  part 0x%04X => %s" % (part, parts))
-    print("  version 0x%01X" % version)
+    print("    vendor 0x%03X => %s" %(vendor, vendors))
+    print("    part 0x%04X => %s" % (part, parts))
+    print("    version 0x%01X" % version)
     return vendors, parts, version
 
 def tdi2ir(tdi):
@@ -212,6 +212,16 @@ select_fmt = [
     ('DPBANKSEL', 4),
 ]
 
+idr_fmt = [
+    ('Revision', 4),
+    ('ContCode', 4),
+    ('IdCode', 7),
+    ('Class', 4),
+    ('Reserved', 5),
+    ('Variant', 4),
+    ('Type', 4),
+]
+
 def bits_decode(formats, nbits, val):
     def maskn(n):
         return (1 << n) - 1
@@ -251,6 +261,33 @@ def bits_str_sparse(vald):
         return ', '.join(ret)
 
 
+def decode_idr(reg):
+    return bits_decode(idr_fmt, 32, reg)
+
+
+def decode_idr_str(reg):
+    ret = decode_idr(reg)
+    mfg = (ret["ContCode"] << 7) | ret["IdCode"]
+    ret["JEP106"] = jed_id2str.get(mfg, "0x%03X" % mfg)
+    del ret["ContCode"]
+    del ret["IdCode"]
+
+    ret["Class"] = {
+        0b0000: "No defined class",
+        0b1000: "Memory Access Port",
+        }.get(ret["Class"], ret["Class"])
+
+    ret["Type"] = {
+        0x0: "JTAG connection",
+        0x1: "AMBA AHB bus",
+        0x2: "AMBA APB2 or APB3 bus",
+        0x4: "AMBA AXI3 or AXI4 bus, with optional ACE-Lite support",
+        }.get(ret["Type"], ret["Type"])
+    return ret
+
+# print(decode_idr_str(int("0001000100011101110000000000000001", 2)))
+# sys.exit(1)
+
 # print(bits_str_sparse(decode_ctrlstat(3)))
 
 # Table 6-1 Summary of the common Access Port (AP) register
@@ -270,12 +307,12 @@ def ap_reg_str(reg):
         }.get(reg, "unknown")
 
 class EyeTAG:
-    def __init__(self):
+    def __init__(self, verbose=0):
         self.cmd_max = float('inf')
         # self.cmd_max = 8
-        self.jtag_verbose = 1
-        self.ir_verbose = 1
-        self.tditdo_verbose = 1
+        self.jtag_verbose = verbose
+        self.ir_verbose = verbose
+        self.tditdo_verbose = verbose
         # techincally some of these are UNKNOWN at init
         self.apsel = 0
         self.apbanksel = 0
@@ -313,7 +350,7 @@ class EyeTAG:
                 if ir == "IDCODE" and self.last_state == "Capture-DR":
                     self.jtag_verbose and print("  IDCODE (full)", tdo[-72:])
                     id32 = tdo2dr(tdo)
-                    self.jtag_verbose and print("  IDCODE (32)", id32)
+                    print("  IDCODE (32)", id32)
                     vendor, part, part_ver = parse_idcode_str(id32)
                 elif ir == "DPACC":
                     # several things in bypass (1 bit each)
@@ -395,7 +432,15 @@ class EyeTAG:
                 pass
             else:
                 pass
-            print("  APACC ap %s, reg %s (0x%02X), cmd %u/%s" % (self.apsel, ap_reg_str(reg), reg, last_cmdi, this_cmdi))
+            if this_tdo_dec is None:
+                this_data = None
+                this_ack = None
+            else:
+                this_data, this_ack = this_tdo_dec
+            reg_str = ap_reg_str(reg)
+            print("  APACC %s ap %s, reg %s (0x%02X), cmd %u/%s" % (rnw.upper(), self.apsel, reg_str, reg, last_cmdi, this_cmdi))
+            if reg_str == "IDR" and rnw == "r" and this_data:
+                print("    Flags: %s" % bits_str_sparse(decode_idr_str(this_data)))
         else:
             assert 0, this_ir
 
@@ -435,10 +480,15 @@ class EyeTAG:
                 # print("iter cmdn last %u, this %u" % (last_data[-1], this_data[-1]), this_ir, last_ir)
                 # when IR switches DR is essentially lost
                 # we'll get a response but its essentially a new transaction
+                """
                 if this_ir != last_ir:
                     self.next_decode(last_data, None)
                 else:
                     self.next_decode(last_data, this_data)
+                """
+                # Seems this is the correct behavior
+                # w/o this things like IDR don't decode correctly
+                self.next_decode(last_data, this_data)
             else:
                 # print("iter cmdn this %u" % this_data[-1])
                 pass
@@ -455,7 +505,7 @@ def main():
     args = parser.parse_args()
 
     parse_jep106()
-    et = EyeTAG()
+    et = EyeTAG(verbose=args.verbose)
     et.cmd_max = float(args.cmd_max)
     et.run(args.fn_in)
 
