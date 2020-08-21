@@ -154,7 +154,7 @@ If RnW is shifted in as 1, the request is to read the value of the addressed reg
 is ignored. You must read the scan chain again to obtain the value read from the register.
 """
 
-def parse_dpap_tdo(tdo, prefix=""):
+def parse_dpap_tdo(tdo, prefix="", verbose=False):
     assert len(tdo) == 35, len(tdo)
     ackbits = tdo[32:35]
     if ackbits == "010":
@@ -166,10 +166,10 @@ def parse_dpap_tdo(tdo, prefix=""):
     else:
         assert 0, ackbits
     data = int(tdo[0:32], 2)
-    print("  %s tdo data 0x%08X, ack %s" % (prefix, data, ack))
+    verbose and print("  %s tdo data 0x%08X, ack %s" % (prefix, data, ack))
     return data, ack
 
-def parse_dpap_tdi(tdi, prefix=""):
+def parse_dpap_tdi(tdi, prefix="", verbose=False):
     assert len(tdi) == 35
     data = int(tdi[0:32], 2)
     a = int(tdi[32:34], 2)
@@ -178,7 +178,7 @@ def parse_dpap_tdi(tdi, prefix=""):
         rnw = "r"
     else:
         rnw = "w"
-    print("  %s tdi data 0x%08X, a %s, rnw %s" % (prefix, data, a, rnw))
+    verbose and print("  %s tdi data 0x%08X, a %s, rnw %s" % (prefix, data, a, rnw))
     return data, a, rnw
 
 def prepare_format(format):
@@ -253,11 +253,33 @@ def bits_str_sparse(vald):
 
 # print(bits_str_sparse(decode_ctrlstat(3)))
 
+# Table 6-1 Summary of the common Access Port (AP) register
+# Table 8-6 Summary of JTAG Access Port (JTAG-AP) registers
+
+def ap_reg_str(reg):
+    return {
+        0x00: "CSW",
+        0x04: "PSEL",
+        0x08: "PSTA",
+        0x0C: "RES_0C",
+        0x10: "FIFO_10",
+        0x14: "FIFO_14",
+        0x18: "FIFO_18",
+        0x1C: "FIFO_1C",
+        0xFC: "IDR",
+        }.get(reg, "unknown")
+
 class EyeTAG:
     def __init__(self):
         self.cmd_max = float('inf')
         # self.cmd_max = 8
-        self.jtag_verbose = 0
+        self.jtag_verbose = 1
+        self.ir_verbose = 1
+        self.tditdo_verbose = 1
+        # techincally some of these are UNKNOWN at init
+        self.apsel = 0
+        self.apbanksel = 0
+        self.apdpsel = 0
 
     def iter_jtag_wr(self, fn_in):
         self.ir = None
@@ -282,8 +304,9 @@ class EyeTAG:
             elif state == "Shift-IR":
                 ir_raw = tdi2ir(tdi)
                 ir = match_ir(ir_raw)
-                print("")
-                print("  New IR: %s (%s)" % (ir_raw, ir))
+                if self.ir_verbose:
+                    print("")
+                    print("  New IR: %s (%s)" % (ir_raw, ir))
             elif state == "Shift-DR":
                 self.jtag_verbose and print("  TDI %u %s" % (len(tdi), tdi))
                 self.jtag_verbose and print("  TDO %u %s" %(len(tdo), tdo))
@@ -314,6 +337,7 @@ class EyeTAG:
 
         # Command
         last_ir, last_tdi_dec, last_tdo_dec, last_cmdi = last_data
+        datai, a, rnw = last_tdi_dec
         # Response
         if this_data:
             this_ir, this_tdi_dec, this_tdo_dec, this_cmdi = this_data
@@ -325,7 +349,6 @@ class EyeTAG:
             this_cmdi = None
 
         if last_ir == "DPACC":
-            datai, a, rnw = last_tdi_dec
             astr = {
                 0: "UNKNOWN",
                 # 2.3.2 CTRL/STAT, Control/Status register
@@ -351,12 +374,28 @@ class EyeTAG:
                     _this_data, this_ack = this_tdo_dec
                 print("  DPACC W %s (cmd %u/%s): 0x%08X, ack %s" % (astr, last_cmdi, this_cmdi, datai, this_ack))
                 if astr == "CTRL_STAT":
-                    print("  Flags: %s" % bits_str_sparse(decode_ctrlstat(datai)))
+                    print("    Flags: %s" % bits_str_sparse(decode_ctrlstat(datai)))
                 if astr == "SELECT":
-                    print("    Flags: %s" % bits_str_sparse(decode_select(datai)))
+                    flags = decode_select(datai)
+                    print("    Flags: %s" % bits_str_sparse(flags))
+                    self.apsel = flags["APSEL"]
+                    self.apbanksel = flags["APBANKSEL"]
+                    self.dpbanksel = flags["DPBANKSEL"]
 
         elif last_ir == "APACC":
-            print("  APACC (cmd %u/%s)" % (last_cmdi, this_cmdi))
+            """
+            AP address space is 256 bytes composed of 8 groups, each with 8 32 bit words
+            Address:
+            -upper 4 bits are from APSEL
+            -middle 2 bits are from command
+            -lower 2 bits are assumed (since 32 bit word => 4 8 bit words)
+            """
+            reg = (self.apbanksel << 4) | (a << 2)
+            if rnw == "r":
+                pass
+            else:
+                pass
+            print("  APACC ap %s, reg %s (0x%02X), cmd %u/%s" % (self.apsel, ap_reg_str(reg), reg, last_cmdi, this_cmdi))
         else:
             assert 0, this_ir
 
@@ -364,13 +403,13 @@ class EyeTAG:
         ir, tdi, tdo = next(self.cmds)
         if ir == "DPACC":
             # Table 3-6 JTAG-DP target response summary, when previous scan a was a DPACC access
-            tdi_dec = parse_dpap_tdi(tdi, "cmd %u DPACC" % self.cmdn)
-            tdo_dec = parse_dpap_tdo(tdo, "cmd %u DPACC" % self.cmdn)
+            tdi_dec = parse_dpap_tdi(tdi, "cmd %u DPACC" % self.cmdn, verbose=self.tditdo_verbose)
+            tdo_dec = parse_dpap_tdo(tdo, "cmd %u DPACC" % self.cmdn, verbose=self.tditdo_verbose)
             return ir, tdi_dec, tdo_dec, self.cmdn
         elif ir == "APACC":
             # Table 3-7 JTAG-DP target response summary, when previous scan a was an APACC access
-            tdi_dec = parse_dpap_tdi(tdi, "cmd %u APACC" % self.cmdn)
-            tdo_dec = parse_dpap_tdo(tdo, "cmd %u APACC" % self.cmdn)
+            tdi_dec = parse_dpap_tdi(tdi, "cmd %u APACC" % self.cmdn, verbose=self.tditdo_verbose)
+            tdo_dec = parse_dpap_tdo(tdo, "cmd %u APACC" % self.cmdn, verbose=self.tditdo_verbose)
             return ir, tdi_dec, tdo_dec, self.cmdn
         else:
             assert 0, ir
