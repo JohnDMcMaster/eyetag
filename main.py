@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+
 """
 Focus is on ARM ADI
 But should be extenable to other devices if there is demand... 
@@ -8,6 +9,7 @@ IHI0031C_debug_interface_as.pdf
 """
 
 import re
+from collections import namedtuple, OrderedDict
 
 part_id2str = {
     "ARM Ltd.": {
@@ -179,6 +181,68 @@ def parse_dpap_tdi(tdi, prefix=""):
     print("  %s tdi data 0x%08X,  a %s, rnw %s" % (prefix, data, a, rnw))
     return data, a, rnw
 
+def prepare_format(format):
+    pass
+
+ctrlstat = [
+    # MSB
+    'CSYSPWRUPACK',
+    'CSYSPWRUPREQ',
+    'CDBGPWRUPACK',
+    'CDBGPWRUPREQ',
+    'CDBGRSTACK',
+    'CDBGRSTREQ',
+    ('RES0', 2), 
+    ('TRNCNT', 12),
+    ('MASKLANE', 4),
+    'WDATAERR',
+    'READOK',
+    'STICKYERR',
+    'STICKYCMP',
+    ('TRNMODE', 2),
+    'STICKYORUN',
+    'ORUNDETECT',
+    # LSB
+    ]
+
+def bits_decode(formats, nbits, val):
+    def maskn(n):
+        return (1 << n) - 1
+
+    ret = OrderedDict()
+    # next high bit to parse
+    bith = nbits - 1
+    for aformat in formats:
+        if type(aformat) == tuple:
+            name, thisbits = aformat
+        else:
+            name = aformat
+            thisbits = 1
+        bitl = bith - thisbits + 1
+        thisval = (val >> bitl) & maskn(thisbits)
+        assert name not in ret
+        ret[name] = thisval
+        # print(name, bith, bitl, thisbits)
+        bith = bitl - 1
+    assert bith == -1, bith
+    return ret
+
+def decode_ctrlstat(reg):
+    return bits_decode(ctrlstat, 32, reg)
+
+def bits_str_sparse(vald):
+    ret = []
+    for k, v in vald.items():
+        if v:
+            ret.append("%s %s" % (k, v))
+    if len(ret) == 0:
+        return "none"
+    else:
+        return ', '.join(ret)
+
+
+# print(bits_str_sparse(decode_ctrlstat(3)))
+
 class EyeTAG:
     def __init__(self):
         self.cmd_max = float('inf')
@@ -223,30 +287,26 @@ class EyeTAG:
                     yield ir, tdi[2:], tdo[2:]
             last_state = state
 
-    def next_decode(self):
-        def next_data():
-            ir, tdi, tdo = next(self.cmds)
-            if ir == "DPACC":
-                # Table 3-6 JTAG-DP target response summary, when previous scan a was a DPACC access
-                tdi_dec = parse_dpap_tdi(tdi, "DPACC")
-                tdo_dec = parse_dpap_tdo(tdo, "DPACC")
-                return ir, tdi_dec, tdo_dec
-            elif ir == "APACC":
-                # Table 3-7 JTAG-DP target response summary, when previous scan a was an APACC access
-                tdi_dec = parse_dpap_tdi(tdi, "APACC")
-                tdo_dec = parse_dpap_tdo(tdo, "APACC")
-                return ir, tdi_dec, tdo_dec
-            else:
-                assert 0, ir
+    def next_decode(self, last_data, this_data):
+        """
+        Decode the command issued in last_data
+        If possible, use the response in this_data
+        Ignore the old response in last_data and the new command in this_data
+        """
 
-        try:
-            ir, tdi_dec, tdo_dec = next_data()
-        except StopIteration:
-            raise
-            # return None
+        # Command
+        last_ir, last_tdi_dec, last_tdo_dec, last_cmdi = last_data
+        # Response
+        if this_data:
+            this_ir, this_tdi_dec, this_tdo_dec, this_cmdi = this_data
+        # Last command has no response
+        else:
+            this_dir = None
+            this_tdi_dec = None
+            this_tdo_dec = None
 
-        if ir == "DPACC":
-            datai, a, rnw = tdi_dec
+        if last_ir == "DPACC":
+            datai, a, rnw = last_tdi_dec
             astr = {
                 0: "UNKNOWN",
                 # 2.3.2 CTRL/STAT, Control/Status register
@@ -254,31 +314,52 @@ class EyeTAG:
                 2: "SELECT",
                 3: "RDBUFF",
                 }[a]
-            print("  DPACC %s %s pending..." % (rnw, astr))
             if rnw == "r":
-                # read response
-                ir2, tdi_dec2, tdo_dec2 = next_data()
-                assert ir2 == "DPACC", ir2
-                datao, ack = tdo_dec2
-                print("  DPACC R %s: 0x%08X, ack %s" % (astr, datao, ack))
+                this_data, this_ack = this_tdo_dec
+                print("  DPACC R %s (cmd %u/%u): 0x%08X, ack %s" % (astr, last_cmdi, this_cmdi, this_data, this_ack))
+                if astr == "CTRL_STAT":
+                    print("  Flags: %s" % bits_str_sparse(decode_ctrlstat(this_data)))
             else:
-                # read response
-                ir2, tdi_dec2, tdo_dec2 = next_data()
-                datao, ack = tdo_dec2
-                print("  DPACC W %s: 0x%08X, ack %s" % (astr, datai, ack))
+                _this_data, this_ack = this_tdo_dec
+                print("  DPACC W %s (cmd %u/%u): 0x%08X, ack %s" % (astr, last_cmdi, this_cmdi, datai, this_ack))
+                if astr == "CTRL_STAT":
+                    print("  Flags: %s" % bits_str_sparse(decode_ctrlstat(datai)))
 
-        elif ir == "APACC":
+        elif last_ir == "APACC":
             pass
+        else:
+            assert 0, this_ir
+
+    def next_data(self):
+        ir, tdi, tdo = next(self.cmds)
+        if ir == "DPACC":
+            # Table 3-6 JTAG-DP target response summary, when previous scan a was a DPACC access
+            tdi_dec = parse_dpap_tdi(tdi, "DPACC")
+            tdo_dec = parse_dpap_tdo(tdo, "DPACC")
+            return ir, tdi_dec, tdo_dec, self.cmdn
+        elif ir == "APACC":
+            # Table 3-7 JTAG-DP target response summary, when previous scan a was an APACC access
+            tdi_dec = parse_dpap_tdi(tdi, "APACC")
+            tdo_dec = parse_dpap_tdo(tdo, "APACC")
+            return ir, tdi_dec, tdo_dec, self.cmdn
         else:
             assert 0, ir
 
     def run(self, fn_in):
         self.cmds = self.iter_jtag_wr(fn_in)
-        while True:
+        last_data = None
+        done = False
+        while not done:
             try:
-                self.next_decode()
+                this_data = self.next_data()
             except StopIteration:
+                # There will be one orphaned last
+                # raise
                 break
+
+            if last_data:
+                self.next_decode(last_data, this_data)
+            last_data = this_data
 
 
 def main():
