@@ -137,47 +137,163 @@ def tdi2ir(tdi):
 def tdo2dr(tdo):
     return tdo[-32:]
 
+# 2.2.5 DP architecture version 2 (DPv2) address map
+
+# 2.3.9 SELECT, AP Select register
+
+# 32 bit + 3 bit ack
+# In the Shift-DR state, this data is shifted out, least significant bit first. As shown in Figure 3-7,
+# the first three bits of data shifted out are ACK[2:0].
+
+"""
+If RnW is shifted in as 0, the request is to write the value in DATAIN[31:0] to the addressed register.
+
+If RnW is shifted in as 1, the request is to read the value of the addressed register. The value in DATAIN[31:0]
+is ignored. You must read the scan chain again to obtain the value read from the register.
+"""
+
+def parse_dpap_tdo(tdo, prefix=""):
+    assert len(tdo) == 35, len(tdo)
+    ackbits = tdo[32:35]
+    if ackbits == "010":
+        # OK/FAULT
+        ack = "OKF"
+    elif ackbits == "001":
+        ack = "WAIT"
+    # All other ACK encodings are reserved.
+    else:
+        assert 0, ackbits
+    data = int(tdo[0:32], 2)
+    print("  %s tdo data 0x%08X, ack %s" % (prefix, data, ack))
+    return data, ack
+
+def parse_dpap_tdi(tdi, prefix=""):
+    assert len(tdi) == 35
+    data = int(tdi[0:32], 2)
+    a = int(tdi[32:34], 2)
+    rnw = int(tdi[34], 2)
+    if rnw:
+        rnw = "r"
+    else:
+        rnw = "w"
+    print("  %s tdi data 0x%08X,  a %s, rnw %s" % (prefix, data, a, rnw))
+    return data, a, rnw
+
+class EyeTAG:
+    def __init__(self):
+        self.cmd_max = float('inf')
+        # self.cmd_max = 8
+
+    def iter_jtag_wr(self, fn_in):
+        self.ir = None
+        self.last_state = None
+        self.vendor = None
+        self.part = None
+        self.part_ver = None
+        self.cmdn = 0
+        for p in iter_decode(fn_in):
+            t, state, tdi, tdo = p
+            if state == 'Run-Test/Idle':
+                self.cmdn += 1
+                if self.cmdn >= self.cmd_max:
+                    return
+                print("")
+                print("Group %u" % self.cmdn)
+            print(state)
+            if state == "Test-Logic-Reset":
+                ir = "IDCODE"
+            elif state == "Capture-IR":
+                ir = "IDCODE"
+            elif state == "Shift-IR":
+                ir_raw = tdi2ir(tdi)
+                ir = match_ir(ir_raw)
+                print("  New IR: %s (%s)" % (ir_raw, ir))
+            elif state == "Shift-DR":
+                print("  TDI %u %s" % (len(tdi), tdi))
+                print("  TDO %u %s" %(len(tdo), tdo))
+                if ir == "IDCODE" and self.last_state == "Capture-DR":
+                    print("  IDCODE (full)", tdo[-72:])
+                    id32 = tdo2dr(tdo)
+                    print("  IDCODE (32)", id32)
+                    vendor, part, part_ver = parse_idcode_str(id32)
+                elif ir == "DPACC":
+                    # several things in bypass (1 bit each)
+                    yield ir, tdi[2:], tdo[2:]
+                elif ir == "APACC":
+                    yield ir, tdi[2:], tdo[2:]
+            last_state = state
+
+    def next_decode(self):
+        def next_data():
+            ir, tdi, tdo = next(self.cmds)
+            if ir == "DPACC":
+                # Table 3-6 JTAG-DP target response summary, when previous scan a was a DPACC access
+                tdi_dec = parse_dpap_tdi(tdi, "DPACC")
+                tdo_dec = parse_dpap_tdo(tdo, "DPACC")
+                return ir, tdi_dec, tdo_dec
+            elif ir == "APACC":
+                # Table 3-7 JTAG-DP target response summary, when previous scan a was an APACC access
+                tdi_dec = parse_dpap_tdi(tdi, "APACC")
+                tdo_dec = parse_dpap_tdo(tdo, "APACC")
+                return ir, tdi_dec, tdo_dec
+            else:
+                assert 0, ir
+
+        try:
+            ir, tdi_dec, tdo_dec = next_data()
+        except StopIteration:
+            raise
+            # return None
+
+        if ir == "DPACC":
+            datai, a, rnw = tdi_dec
+            astr = {
+                0: "UNKNOWN",
+                # 2.3.2 CTRL/STAT, Control/Status register
+                1: "CTRL_STAT",
+                2: "SELECT",
+                3: "RDBUFF",
+                }[a]
+            print("  DPACC %s %s pending..." % (rnw, astr))
+            if rnw == "r":
+                # read response
+                ir2, tdi_dec2, tdo_dec2 = next_data()
+                assert ir2 == "DPACC", ir2
+                datao, ack = tdo_dec2
+                print("  DPACC R %s: 0x%08X, ack %s" % (astr, datao, ack))
+            else:
+                # read response
+                ir2, tdi_dec2, tdo_dec2 = next_data()
+                datao, ack = tdo_dec2
+                print("  DPACC W %s: 0x%08X, ack %s" % (astr, datai, ack))
+
+        elif ir == "APACC":
+            pass
+        else:
+            assert 0, ir
+
+    def run(self, fn_in):
+        self.cmds = self.iter_jtag_wr(fn_in)
+        while True:
+            try:
+                self.next_decode()
+            except StopIteration:
+                break
+
+
 def main():
     import argparse
 
     parser = argparse.ArgumentParser(description='')
     parser.add_argument('--verbose', action="store_true")
+    parser.add_argument('--cmd-max', type=str, default='inf')
     parser.add_argument('fn_in', default=None, help='')
     args = parser.parse_args()
 
     parse_jep106()
-    ir = None
-    last_state = None
-    vendor = None
-    part = None
-    part_ver = None
-    cmdn = 0
-    cmd_max = 5
-    for p in iter_decode(args.fn_in):
-        t, state, tdi, tdo = p
-        if state == 'Run-Test/Idle':
-            print("")
-            cmdn += 1
-            if cmdn >= cmd_max:
-                return
-        print(state)
-        if state == "Test-Logic-Reset":
-            ir = "IDCODE"
-        if state == "Capture-IR":
-            ir = "IDCODE"
-        if state == "Shift-IR":
-            ir_raw = tdi2ir(tdi)
-            ir = match_ir(ir_raw)
-            print("  New IR: %s (%s)" % (ir_raw, ir))
-        if state == "Shift-DR":
-            print("  TDI", tdi)
-            print("  TDO", tdo)
-        if ir == "IDCODE" and state == "Shift-DR" and last_state == "Capture-DR":
-            print("  IDCODE (full)", tdo[-72:])
-            id32 = tdo2dr(tdo)
-            print("  IDCODE (32)", id32)
-            vendor, part, part_ver = parse_idcode_str(id32)
-        last_state = state
+    et = EyeTAG()
+    et.cmd_max = float(args.cmd_max)
+    et.run(args.fn_in)
 
 if __name__ == "__main__":
     main()
