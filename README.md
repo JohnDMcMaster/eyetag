@@ -1,5 +1,5 @@
 # eyetag
-Decode JTAG traffic exported from Saleae into high level ARM JTAG commands (ex: APSEL) 
+eyetag: the JTAG inspector. Decodes JTAG traffic exported from Saleae into high level ARM JTAG commands (ex: APSEL) 
 
 You probably need to be somewhat familiar with the ARM Debug Interface to understand the output
 
